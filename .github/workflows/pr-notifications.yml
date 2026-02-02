@@ -1,0 +1,102 @@
+name: Discord PR Notifications
+
+on:
+  workflow_call:
+    secrets:
+      USER_MAPPING:
+        required: true
+      DISCORD_WEBHOOK_URL:
+        required: true
+      DISCORD_BOT_TOKEN:
+        required: true
+
+jobs:
+  # ====================================================
+  # JOB 1: DM Bot (Personal Alerts)
+  # ====================================================
+  notify-dm:
+    runs-on: ubuntu-latest
+    # LOGIC: Run if it's a comment, review request, assigned, or ready... BUT NOT from a bot.
+    if: >
+      (github.event_name == 'issue_comment' ||
+      github.event_name == 'pull_request_review_comment' ||
+      github.event.action == 'review_requested' ||
+      github.event.action == 'ready_for_review' ||
+      github.event.action == 'assigned') &&
+      github.event.sender.type != 'Bot'
+    steps:
+      - name: Checkout Infra Scripts
+        uses: actions/checkout@v3
+        with:
+          repository: pardoBros/core-infra
+          path: infra-scripts
+          sparse-checkout: scripts
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+
+      - name: Run DM Logic
+        run: |
+          python infra-scripts/scripts/notify.py --mapping-b64 "${{ secrets.USER_MAPPING }}"
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+
+  # ====================================================
+  # JOB 2: Channel Announcer (Public Status)
+  # ====================================================
+  notify-channel:
+    runs-on: ubuntu-latest
+    # Only Open (non-draft), Close, or Ready.
+    # Ignores comments and review requests to avoid spamming the channel.
+    if: >
+      github.event.action == 'closed' ||
+      github.event.action == 'ready_for_review' ||
+      (github.event.action == 'opened' && github.event.pull_request.draft == false)
+    steps:
+      - name: Determine Status
+        id: state
+        run: |
+          # 1. HANDLE MERGED/CLOSED
+          if [ "${{ github.event.action }}" == "closed" ]; then
+            if [ "${{ github.event.pull_request.merged }}" == "true" ]; then
+              # Discord Purple (Decimal)
+              echo "COLOR=9000933" >> $GITHUB_OUTPUT
+              echo "MSG=✅ PR Merged" >> $GITHUB_OUTPUT
+            else
+              # Discord Red (Decimal)
+              echo "COLOR=13578542" >> $GITHUB_OUTPUT
+              echo "MSG=⛔ PR Closed (Rejected)" >> $GITHUB_OUTPUT
+            fi
+
+          # 2. HANDLE NEWLY READY
+          else
+             # Discord Green (Decimal)
+             echo "COLOR=2993230" >> $GITHUB_OUTPUT
+             echo "MSG=🚀 PR Ready for Review" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post to Discord Channel
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TITLE: ${{ github.event.pull_request.title }}
+          URL: ${{ github.event.pull_request.html_url }}
+          MSG: ${{ steps.state.outputs.MSG }}
+          COLOR: ${{ steps.state.outputs.COLOR }}
+          AUTHOR: ${{ github.actor }}
+        run: |
+          # Send Embed to Discord Webhook
+          curl -H "Content-Type: application/json" \
+          -d "{
+            \"username\": \"PR Bot\",
+            \"embeds\": [{
+              \"title\": \"$MSG: $TITLE\",
+              \"url\": \"$URL\",
+              \"color\": $COLOR,
+              \"footer\": { \"text\": \"Author: $AUTHOR\" }
+            }]
+          }" \
+          $DISCORD_WEBHOOK
