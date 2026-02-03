@@ -1,5 +1,5 @@
 import os
-import argparse  # Added to read the arguments from YAML
+import argparse
 import json
 import base64
 import re
@@ -16,9 +16,11 @@ COLORS = {
     "CLOSED": 15548997,   # Red
     "INFO": 3447003,      # Blue
     "COMMENT": 16776960,  # Yellow
+    "APPROVED": 5763719,  # Green (Same as Open)
+    "CHANGES": 15548997   # Red (Same as Closed)
 }
 
-# --- DISCORD API HELPERS (Bot Mode) ---
+# --- DISCORD API HELPERS ---
 def send_dm(user_id, embed):
     token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
     if not token or not user_id:
@@ -45,7 +47,7 @@ def send_dm(user_id, embed):
         print(f"❌ Could not open DM with {user_id}: {e}")
         return
 
-    # 2. Send Message to that Channel
+    # 2. Send Message
     msg_url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     payload = {"embeds": [embed]}
 
@@ -62,35 +64,22 @@ def send_dm(user_id, embed):
 
 # --- MAIN EXECUTION ---
 def main():
-    # 1. Parse Arguments (To get the mapping securely)
     parser = argparse.ArgumentParser()
     parser.add_argument("--mapping-b64", help="Base64 encoded user mapping string")
     args = parser.parse_args()
 
-    # 2. Load User Mapping
+    # Load Mapping
     user_map = {}
     if args.mapping_b64:
         try:
-            # Decode the argument passed from YAML
             decoded_json = base64.b64decode(args.mapping_b64).decode("utf-8")
             user_map = json.loads(decoded_json)
-            print(f"✅ Loaded mapping for {len(user_map)} users.")
         except Exception as e:
             print(f"⚠️ Error decoding User Mapping: {e}")
-            user_map = {}
-    else:
-        # Fallback: Check environment variable if arg is missing
-        print("⚠️ No --mapping-b64 argument. Checking env vars...")
-        try:
-            mapping_b64_env = os.environ.get("USER_MAPPING", "").strip()
-            if mapping_b64_env:
-                user_map = json.loads(base64.b64decode(mapping_b64_env).decode("utf-8"))
-        except:
-            pass
 
-    # 3. Load GitHub Event Data
+    # Load Event
     if "GITHUB_EVENT_PATH" not in os.environ:
-        print("❌ Error: GITHUB_EVENT_PATH not set. Are you running locally without mocking?")
+        print("❌ Error: GITHUB_EVENT_PATH not set.")
         return
 
     with open(os.environ["GITHUB_EVENT_PATH"]) as f:
@@ -103,7 +92,7 @@ def main():
     # --- BUILD CONTEXT ---
     data = {}
 
-    # CASE: PULL REQUEST
+    # 1. Standard Pull Request
     if event_name == "pull_request":
         pr = event["pull_request"]
         data = {
@@ -116,21 +105,32 @@ def main():
             "author": pr["user"]["login"],
             "head": pr["head"]["ref"],
             "base": pr["base"]["ref"],
-            "draft": pr.get("draft", False),
             "merged": pr.get("merged", False)
         }
 
-    # CASE: COMMENT (Issue or Review)
+    # 2. Review Submission (Approvals/Changes) - NEW!
+    elif event_name == "pull_request_review":
+        pr = event["pull_request"]
+        review = event["review"]
+        data = {
+            "type": "review_submit",
+            "title": pr["title"],
+            "url": review["html_url"],
+            "repo": event["repository"]["full_name"],
+            "sender": review["user"]["login"], # The Reviewer
+            "avatar": review["user"]["avatar_url"],
+            "author": pr["user"]["login"],     # The PR Author (Target)
+            "head": pr["head"]["ref"],
+            "base": pr["base"]["ref"],
+            "state": review["state"].lower()   # approved, changes_requested, commented
+        }
+
+    # 3. Comments
     elif event_name in ["issue_comment", "pull_request_review_comment"]:
-        # Safety check: Ensure it's a PR comment, not a regular issue comment
         if event_name == "issue_comment" and "pull_request" not in event["issue"]:
-            print("Skipping: Comment is on a regular Issue, not a PR.")
             exit(0)
-
         comment = event["comment"]
-        # Handle difference in payload structure between issue_comment and review_comment
         pr_source = event["pull_request"] if "pull_request" in event else event["issue"]
-
         data = {
             "type": "comment",
             "title": pr_source["title"],
@@ -139,14 +139,14 @@ def main():
             "sender": comment["user"]["login"],
             "avatar": comment["user"]["avatar_url"],
             "author": pr_source["user"]["login"],
-            "head": "", "base": "", # Comments don't usually imply branch changes
+            "head": "", "base": "",
             "body": comment["body"]
         }
     else:
         print(f"Skipping unsupported event: {event_name}")
         exit(0)
 
-    # --- LOGIC: BUILD EMBED & RECIPIENTS ---
+    # --- LOGIC: BUILD EMBED ---
     recipients = []
 
     embed = {
@@ -166,66 +166,69 @@ def main():
     if data["head"]:
          embed["fields"].append({"name": "🌿 Branch", "value": f"`{data['head']}` ➝ `{data['base']}`", "inline": True})
 
-    # 1. REVIEW REQUESTED -> Notify Reviewer
-    if event_name == "pull_request" and action == "review_requested":
+    # --- RULES ---
+
+    # 1. PR APPROVED / CHANGES REQUESTED (New Logic)
+    if event_name == "pull_request_review":
+        if data["state"] == "approved":
+            recipients.append(data["author"])
+            embed["color"] = COLORS["APPROVED"]
+            embed["description"] = "**✅ PR Approved!**"
+            embed["fields"].append({"name": "Reviewer", "value": f"Approved by {data['sender']}", "inline": False})
+
+        elif data["state"] == "changes_requested":
+            recipients.append(data["author"])
+            embed["color"] = COLORS["CHANGES"]
+            embed["description"] = "**⚠️ Changes Requested**"
+            embed["fields"].append({"name": "Reviewer", "value": f"{data['sender']} requested changes.", "inline": False})
+
+        else:
+            print("Skipping 'commented' review type (handled by comment logic)")
+
+    # 2. REVIEW REQUESTED
+    elif event_name == "pull_request" and action == "review_requested":
         if "requested_reviewer" in event:
             recipients.append(event["requested_reviewer"]["login"])
             embed["color"] = COLORS["INFO"]
             embed["description"] = "**Review Requested**\nYou were requested to review this PR."
 
-    # 2. ASSIGNED -> Notify Assignee
+    # 3. ASSIGNED
     elif event_name == "pull_request" and action == "assigned":
         if "assignee" in event and event["assignee"]:
              recipients.append(event["assignee"]["login"])
              embed["color"] = COLORS["INFO"]
-             embed["description"] = "**Assigned to You**\nYou were assigned to this PR."
+             embed["description"] = "**Assigned to You**"
 
-    # 3. MERGED / CLOSED -> Notify PR Author
+    # 4. CLOSED / MERGED
     elif event_name == "pull_request" and action == "closed":
         if data["author"] != data["sender"]:
             recipients.append(data["author"])
+        embed["color"] = COLORS["MERGED"] if data["merged"] else COLORS["CLOSED"]
+        embed["description"] = "**Your PR was Merged!**" if data["merged"] else "**Your PR was Closed** (Unmerged)"
 
-        if data["merged"]:
-            embed["color"] = COLORS["MERGED"]
-            embed["description"] = "**Your PR was Merged!**"
-        else:
-            embed["color"] = COLORS["CLOSED"]
-            embed["description"] = "**Your PR was Closed** (Unmerged)"
-
-    # 4. COMMENTS -> Notify PR Author OR Mentioned Users
+    # 5. COMMENTS
     elif data.get("type") == "comment":
         embed["color"] = COLORS["COMMENT"]
         embed["description"] = "**New Comment**"
-        # Truncate long comments
         body_preview = data["body"][:200] + "..." if len(data["body"]) > 200 else data["body"]
         embed["fields"].append({"name": "Message", "value": body_preview, "inline": False})
 
-        # Notify Author (if they didn't write the comment)
         if data["author"] != data["sender"]:
             recipients.append(data["author"])
-
-        # Notify @Mentions
         mentions = re.findall(r"@([a-zA-Z0-9-]+)", data["body"])
         recipients.extend(mentions)
 
-    # --- SEND LOOP ---
+    # --- SEND ---
     unique_recipients = list(set(recipients))
-
-    if not unique_recipients:
-        print("ℹ️ No relevant users to DM.")
-
     for gh_user in unique_recipients:
-        # Don't notify the person who triggered the action (Sender)
-        if gh_user == data["sender"]:
-            continue
+        if gh_user == data["sender"]: continue # Don't DM yourself
 
         discord_id = user_map.get(gh_user)
-
         if discord_id:
-            print(f"🚀 Sending DM to GitHub user: {gh_user} (Discord: {discord_id})")
+            print(f"🚀 Sending DM to {gh_user} ({discord_id})")
             send_dm(discord_id, embed)
         else:
-            print(f"⚠️ Skipping {gh_user}: No Discord ID found in mapping.")
+            print(f"⚠️ Skipping {gh_user}: No Discord ID mapped.")
 
 if __name__ == "__main__":
     main()
